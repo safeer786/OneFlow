@@ -1,0 +1,507 @@
+#Copyright 2008-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+#Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance with the License. A copy of the License is located at
+#http://aws.amazon.com/apache2.0/
+#or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+
+#Upload SAML
+#Activate Config and Snapshots
+#Change Bucketpolicy in Billing
+
+from __future__ import print_function
+import boto3
+import botocore
+import time
+import sys
+import argparse
+import json
+
+'''AWS Organizations Create Account and Provision Resources via CloudFormation
+
+This module creates a new account using Organizations, then calls CloudFormation to deploy baseline resources within that account via a local tempalte file.
+
+'''
+
+__version__ = '0.1'
+__author__ = '@SebastianMarx@'
+__email__ = '@sebastian.marx@allianz.de@'
+
+def lambda_handler(event, context):
+    
+    account_id, accessKeyId, secretAccessKey = create(event)
+
+    returnvalue = account_id + "-" + accessKeyId + "-" + secretAccessKey
+
+    return returnvalue
+
+def getClient(service,credentials):
+
+
+    serviceClient = boto3.client(service,aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken'],
+                          region_name='eu-central-1')
+
+    return serviceClient
+
+def create_account(account_name,
+        account_email,
+        account_role,
+        access_to_billing,
+        organization_unit_id,
+        scp):
+
+    '''
+        Create a new AWS account and add it to an organization
+    '''
+    accountNameForOrganizations = account_name + '.mt.cloud'
+    client = boto3.client('organizations')
+    try:
+        create_account_response = client.create_account(Email=account_email, AccountName=accountNameForOrganizations,
+                                                        RoleName=account_role,
+                                                        IamUserAccessToBilling=access_to_billing)
+    except botocore.exceptions.ClientError as e:
+        print(e)
+        sys.exit(1)
+
+    time.sleep(10)
+
+    account_status = 'IN_PROGRESS'
+    while account_status == 'IN_PROGRESS':
+        create_account_status_response = client.describe_create_account_status(CreateAccountRequestId=create_account_response.get('CreateAccountStatus').get('Id'))
+        print("Create account status " + str(create_account_status_response))
+        account_status = create_account_status_response.get('CreateAccountStatus').get('State')
+    if account_status == 'SUCCEEDED':
+        account_id = create_account_status_response.get('CreateAccountStatus').get('AccountId')
+    elif account_status == 'FAILED':
+        print("Account creation failed: " + create_account_status_response.get('CreateAccountStatus').get('FailureReason'))
+        sys.exit(1)
+    root_id = client.list_roots().get('Roots')[0].get('Id')
+
+    # Move account to the org
+    if organization_unit_id is not None:
+        try:
+            describe_organization_response = client.describe_organizational_unit(OrganizationalUnitId=organization_unit_id)
+            move_account_response = client.move_account(AccountId=account_id, SourceParentId=root_id,
+                                                        DestinationParentId=organization_unit_id)
+        except Exception as ex:
+            template = "An exception of type {0} occurred. Arguments:\n{1!r} "
+            message = template.format(type(ex).__name__, ex.args)
+            # create_organizational_unit(organization_unit_id)
+            print(message)
+
+    # Attach policy to account if exists
+    #if scp is not None:
+    #    attach_policy_response = client.attach_policy(PolicyId=scp,
+    #    TargetId=account_id)
+    #    print("Attach policy response "+str(attach_policy_response))
+
+    #sleep needed since s3 sign up takes time
+    print('Sleeps for 10s')
+    time.sleep(10)
+    return account_id
+
+def assume_role(account_id, account_role):
+
+    '''
+        Assume admin role within the newly created account and return credentials
+    '''
+
+    sts_client = boto3.client('sts')
+    role_arn = 'arn:aws:iam::' + account_id + ':role/' + account_role
+
+    # Call the assume_role method of the STSConnection object and pass the role
+    # ARN and a role session name.
+
+    assuming_role = True
+    while assuming_role is True:
+        try:
+            assuming_role = False
+            assumedRoleObject = sts_client.assume_role(RoleArn=role_arn,
+                RoleSessionName="NewAccountRole")
+        except botocore.exceptions.ClientError as e:
+            assuming_role = True
+            print(e)
+            print("Retrying...")
+            time.sleep(10)
+
+    # From the response that contains the assumed role, get the temporary
+    # credentials that can be used to make subsequent API calls
+    return assumedRoleObject['Credentials']
+
+def get_template(template_file):
+
+    '''
+        Read a template file and return the contents
+    '''
+
+    print("Reading resources from " + template_file)
+    f = open(template_file, "r")
+    cf_template = f.read()
+    return cf_template
+
+def deploy_resources(credentials, template, stack_name, stack_region, admin_username, admin_password):
+
+    '''
+        Create a CloudFormation stack of resources within the new account
+    '''
+
+    datestamp = time.strftime("%d/%m/%Y")
+    client = boto3.client('cloudformation',
+                          aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken'],
+                          region_name=stack_region)
+    print("Creating stack " + stack_name + " in " + stack_region)
+
+    creating_stack = True
+    while creating_stack is True:
+        try:
+            creating_stack = False
+            create_stack_response = client.create_stack(StackName=stack_name,
+                TemplateBody=template,
+                Parameters=[{
+                        'ParameterKey' : 'AdminUsername',
+                        'ParameterValue' : admin_username
+                    },
+                    {
+                        'ParameterKey' : 'AdminPassword',
+                        'ParameterValue' : admin_password
+                    }],
+                NotificationARNs=[],
+                Capabilities=['CAPABILITY_NAMED_IAM',],
+                OnFailure='ROLLBACK',
+                Tags=[{
+                        'Key': 'ManagedResource',
+                        'Value': 'True'
+                    },
+                    {
+                        'Key': 'DeployDate',
+                        'Value': datestamp
+                    }])
+        except botocore.exceptions.ClientError as e:
+            creating_stack = True
+            print(e)
+            print("Retrying...")
+            time.sleep(10)
+
+    stack_building = True
+    print("Stack creation in process...")
+    print(create_stack_response)
+    while stack_building is True:
+        event_list = client.describe_stack_events(StackName=stack_name).get("StackEvents")
+        stack_event = event_list[0]
+
+        if (stack_event.get('ResourceType') == 'AWS::CloudFormation::Stack' and stack_event.get('ResourceStatus') == 'CREATE_COMPLETE'):
+            stack_building = False
+            print("Stack construction complete.")
+        elif (stack_event.get('ResourceType') == 'AWS::CloudFormation::Stack' and stack_event.get('ResourceStatus') == 'ROLLBACK_COMPLETE'):
+            stack_building = False
+            print("Stack construction failed.")
+            sys.exit(1)
+        else:
+            print(stack_event)
+            print("Stack building . . .")
+            time.sleep(10)
+
+    stack = client.describe_stacks(StackName=stack_name)
+    return stack
+
+#Uploading Metadata to S3-bucket is required => Bucket SAML/Federation
+def createIDP(credentials):
+
+    try:
+        s3 = getClient('s3',credentials)
+        obj = s3.get_object(Bucket='aws-multi-tenant', Key='SAML/FederationMetadata.xml')
+        print(obj)
+        ADFSMeta = obj['Body'].read()
+        iamClient = getClient('iam',credentials)
+
+        response = iamClient.create_saml_provider(SAMLMetadataDocument=ADFSMeta, Name='ADFS')
+        return  response
+    except:
+        print('IDP already existed')
+        return 'IDP already existed'
+
+#Missing: boto Function to activate config
+def activateConfig(accountID,credentials):
+
+    configBucketName = 'config-bucket-' + accountID
+    #Create S3 Bucket for config store
+    configBucketPolicy = {
+      "Version": "2012-10-17",
+      "Statement": [{
+          "Sid": "AWSConfigBucketPermissionsCheck",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": ["config.amazonaws.com"]
+         },
+          "Action": "s3:GetBucketAcl",
+          "Resource": "arn:aws:s3:::" + configBucketName
+        },
+        {
+          "Sid": " AWSConfigBucketDelivery",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": ["config.amazonaws.com"]
+          },
+          "Action": "s3:PutObject",
+          "Resource": "arn:aws:s3:::" + configBucketName + "/AWSLogs/" + accountID + "/Config/*",
+          "Condition": { 
+            "StringEquals": { 
+              "s3:x-amz-acl": "bucket-owner-full-control" 
+            }
+          }
+        }]
+    }  
+
+    createS3Bucket(configBucketName,credentials,configBucketPolicy)
+
+    #IAM Role for config
+    #==> Template Torsten
+
+    return 'activatedConfig'
+
+def updateCloudtrailPolicy(newAccountID):
+
+    client = boto3.client('sns')
+
+    response = client.publish(TopicArn = 'arn:aws:sns:eu-central-1:843848127184:AZD-CO-ACCOUNT-AUDIT-MODIFYBUCKETPOLICY',
+        Message = 'SNSMessage',
+        Subject = 'SNSSubject',
+        MessageAttributes = {'accountId': {'DataType': 'String','StringValue': newAccountID}})
+
+
+    return 'updatedCloudtrail'
+
+#Todo: change policy
+def createCloudtrails(accountID,credentials):
+
+    updateCloudtrailPolicy(accountID)
+    trailClient = boto3.client('cloudtrail',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken'],
+                          region_name='eu-central-1')
+
+
+    ############Local trail####################
+    logGroup = 'CloudTrail/DefaultLogGroup'
+    logRole = 'CloudTrail_CloudWatchLogs_Role'
+    logBucket = 'cloudtrail-' + accountID
+
+    #create IAM-role for logging
+    try:
+         createLogRole(logRole,credentials)
+    except:
+        print('Exception in createLogRole (LogRole already existed?)')
+
+    #create local S3 bucket for the trail
+    logBucketPolicy = {
+    "Version": "2012-10-17",
+    "Statement": [{
+            "Sid": "AWSCloudTrailAclCheck20150319",
+            "Effect": "Allow",
+            "Principal": {"Service": "cloudtrail.amazonaws.com"},
+            "Action": "s3:GetBucketAcl",
+            "Resource": "arn:aws:s3:::" + logBucket
+        },
+        {
+            "Sid": "AWSCloudTrailWrite20150319",
+            "Effect": "Allow",
+            "Principal": {"Service": "cloudtrail.amazonaws.com"},
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::" + logBucket + "/AWSLogs/" + accountID + "/*",
+            "Condition": {"StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}}
+        }]
+    }
+
+    try:
+        createS3Bucket(logBucket,credentials,logBucketPolicy)
+
+    except:
+        print('Exception in createLogBucket (Bucket already existed?)')
+
+    #create loggroup:
+    logsClient = boto3.client('logs',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken'],
+                          region_name='eu-central-1')
+
+    try:
+            response = logsClient.create_log_group(logGroupName=logGroup)
+            print(response)
+    except:
+        print('Exception in createLogGroup (LogGroup already existed?)')
+
+    defaultResponse = ''
+    #Create local trail
+    try:
+        defaultResponse = trailClient.create_trail(Name='default',
+        S3BucketName=logBucket,
+        IncludeGlobalServiceEvents=True,
+        IsMultiRegionTrail=True,
+        EnableLogFileValidation=True,
+        CloudWatchLogsLogGroupArn='arn:aws:logs:eu-central-1:' + accountID + ':log-group:' + logGroup + ':*',
+        CloudWatchLogsRoleArn='arn:aws:iam::' + accountID + ':role/' + logRole)
+    except:
+        print('Trail already existed')
+
+    ############Audit trail####################
+
+    #change bucket-policy
+
+    try:
+
+        auditResponse = trailClient.create_trail(Name='audit-' + accountID,
+        S3BucketName='audit-843848127184',
+        IncludeGlobalServiceEvents=True,
+        IsMultiRegionTrail=True,
+        EnableLogFileValidation=True) 
+    except:
+        print('Trail to audit account already existed')
+
+
+    return 'Created logs and trails'
+
+def createLogRole(logRoleName,credentials):
+
+    iam = boto3.client('iam',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken'],
+                          region_name='eu-central-1')
+
+    roleName = logRoleName
+    policyname = roleName + '_Policy'
+    # Create a policy
+    logRolePolicy = {
+        "Version": "2012-10-17",
+        "Statement": 
+        [{
+                "Effect": "Allow",
+                "Action": "logs:*",
+                "Resource": "*"
+            }]
+    }
+
+    logRoleAssumePolicy = {
+        "Version": "2012-10-17",
+        "Statement": 
+        [{
+              "Effect": "Allow",
+              "Principal": {"Service": ["cloudtrail.amazonaws.com"]},
+              "Action": "sts:AssumeRole"
+            }]
+    }
+
+    response = iam.create_role(Path='/',
+            RoleName=roleName,
+            AssumeRolePolicyDocument=json.dumps(logRoleAssumePolicy),
+            Description='Role for CloudTrail-Logging')
+    response = iam.put_role_policy(RoleName=roleName,PolicyName='Cloudtrail-Policy',PolicyDocument=json.dumps(logRolePolicy))
+
+def createUser(userName, credentials):
+    client = boto3.client('iam',aws_access_key_id=credentials['AccessKeyId'],
+                              aws_secret_access_key=credentials['SecretAccessKey'],
+                              aws_session_token=credentials['SessionToken'],
+                              region_name='eu-central-1')
+    
+
+    uResponse = client.create_user(UserName=userName)
+    print(uResponse)
+    
+    #attach AdminRights to new User
+    pResponse = client.attach_user_policy(PolicyArn='arn:aws:iam::aws:policy/AdministratorAccess',UserName= userName)
+    print(pResponse)
+
+    #createAccessKey
+    response = client.create_access_key(UserName=userName)
+    print(response)
+    return(response['AccessKey']['AccessKeyId'],response['AccessKey']['SecretAccessKey'])
+
+def createS3Bucket(bucketName, credentials, policy):
+
+    s3Client = boto3.client('s3',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken'],
+                          region_name='eu-central-1')
+    s3Client.create_bucket(Bucket=bucketName, CreateBucketConfiguration={'LocationConstraint':'eu-central-1'})
+    response = s3Client.put_bucket_policy(Bucket=bucketName,
+    ConfirmRemoveSelfBucketAccess=False,
+    Policy=json.dumps(policy))
+
+def createAccountAlias(credentials, accountName):
+
+    alias = accountName.lower() + "-mt" # onnly lowercase, digits and hyphens allowed
+    iamClient = boto3.client('iam',aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken'],
+                          region_name='eu-central-1')
+
+    response = iamClient.create_account_alias(AccountAlias=alias)
+
+    return response
+
+def saveIdToParameterStore(accountName,accountID):
+
+    client = boto3.client('ssm')
+
+    response = client.put_parameter(Name='AccountID_' + accountName,
+    Description='This is the AccountID of the account: ' + accountName,
+    Value=accountID,
+    Type='String',
+    Overwrite=False)
+
+    return response
+
+
+def create(event):
+     
+    account_name = event['account_name']
+    account_email = event['account_email']
+    account_role = event['account_role']
+    access_to_billing = event['access_to_billing']
+    organization_unit_id = event['organization_unit_id']
+    jenkins_user = event['jenkins_user']
+    scp = event['scp']
+    existingAccountID = event['accountID']
+
+    print("Creating new account: " + account_name + " (" + account_email + ")")
+    if existingAccountID == 'None':
+        account_id = create_account(account_name, account_email, account_role,access_to_billing, organization_unit_id, scp)
+    #Comment the above line and uncomment the below line to skip account
+    #creation and just test Cfn deployment (for testing)
+    else:
+        account_id = existingAccountID
+    #saveIdToParameterStore(account_name,account_id)
+    print("Created acount: " + account_id)   
+
+    #Account init on other account
+    credentials = assume_role(account_id, account_role)
+
+    accessKeyId, secretAccessKey = createUser(jenkins_user, credentials)
+    
+    #Create IPD-Provider (SAML)
+    idpResponse = createIDP(credentials)
+    print("IDP created: " + str(idpResponse))
+
+    #Activate AWS Config
+    #Activation of AWS Config is done in another file
+
+    #Change Cloudtrail configuration
+    ctResponse = createCloudtrails(account_id,credentials)
+    print("Cloudtrails activated: " + str(ctResponse))
+
+    #Create account alias
+    alias = account_name + '-mt'
+    try:
+        aliasResponse = createAccountAlias(credentials, account_name)
+        print("Alias changed: " + str(aliasResponse))
+    except:
+        print("Alias already existed")
+    
+    #Missing: Delete auto generated VPCs
+
+    print("Account creation complete for account: " + account_id)
+
+    return account_id, accessKeyId, secretAccessKey
+    
