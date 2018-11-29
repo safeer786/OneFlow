@@ -23,8 +23,8 @@ This module creates a new account using Organizations, then calls CloudFormation
 '''
 
 __version__ = '0.1'
-__author__ = '@SebastianMarx@'
-__email__ = '@sebastian.marx@allianz.de@'
+__author__ = '@safeer_mian@'
+__email__ = '@safeer_mian@allianz.de@'
 
 def lambda_handler(event, context):
     
