@@ -1,4 +1,0 @@
-Accounts: '{"966497653753":"ADFS-Audit", "874233888769":"ADFS-Audit", "284894803213":"ADFS-Audit", "784550693460":"ADFS-Audit", "303747409146":"ADFS-Audit" }'
-options: group-policies, role-policies, user-policies, bastionhosts, group-groupmembers, user-keys-last-used' , 'policy-description','complete-report' , 'all'
-command example: python [option] -a [accounts]
-	 python iamreport.py all -a '{"966497653753":"ADFS-Audit", "874233888769":"ADFS-Audit", "284894803213":"ADFS-Audit", "784550693460":"ADFS-Audit", "303747409146":"ADFS-Audit" }'
